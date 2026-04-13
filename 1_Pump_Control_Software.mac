@@ -1,0 +1,945 @@
+/* 
+NIS-Elements macro file NanoJ-Fluidics.mac
+Author: Kees van der Oord <oord@nikonbv.nl>
+Function: controls NanoJ-Fluidics pumps from HendriquesLab
+URLs: 
+   https://github.com/HenriquesLab/NanoJ-Fluidics/wiki 
+   https://www.niwiki.nl/Wiki/index.cgi?topic=3541
+Installation:
+   copy the NkWindow.dll file to the folder c:\Program Files\NIS-Elements
+   copy the NkWin32.mac, NkWindow.mac and this macro file to folder c:\Program Files\NIS-Elements\macros
+   register the NanoJ-Fluidics.mac file to be executed on
+   application startup (Macro | Run Macro on Events | Run on Application Start)
+   or from a macro button.
+Usage:
+   Enter the command NaFl_ShowDialog(); to show the control dialog
+   Add the NaFl_StartPump() or NaFl_StopPump() commands in any ND or Job experiment.
+   Create Macro Toolbar buttons for easy starting/stopping pumps.
+   When closing the dialog it is not destroyed, just hidden. When the macro is run again, the dialog is made visible again.
+   So changes the method 'njfl_ShowDialog' will not be visible. 
+   To destroy the dialog, keep the Control key pressed when clicking on the caption close button.
+   To reset all syringe settings, keep the Control key pressed when closing the setup dialog with the caption close button.
+Versions:
+   3: April  1, 2020: added progress bar, NkWindow eats WM_TIMER during script operation
+   4: April  2, 2020: add '.' to abort command, use Write instead of WriteLine for sending commands, Progressbar updates itself
+   5: April  2, 2020: OpenPreviousPort moved after ShowDialog to prevent macro interpreter error
+   6: April 22, 2020: reset buf when reading pump name, replaced title and section with direct strings 
+                because global strings seems to get corrupted when running the macro again ...
+   7: April 23, 2020: change direction 'Test' max speed and fixed problem with syringe calibration naming
+*/   
+
+#define TESTDIRECTION 1  // infuse
+#define NUMBOARDS 3
+#define NUMPUMPSPERBOARD 4
+#define NUMPUMPS 12
+#define NUMSERINGES 14
+
+global char     njfl_port[64] = "COM12:56200";
+global longlong njfl_handle = 0;
+global char     njfl_profile[64];
+global char *   njfl_section = "NanoJ-Fluidics";
+global char *   njfl_title = "NanoJ-Fluidics";
+global char     njfl_log[2048];
+global long     njfl_pb_dir;   // progress bar direction
+global long     njfl_pb_range; // progress bar range
+
+global long njfl_dlg;
+global long njfl_dlg_top = -1;
+global long njfl_dlg_left = -1;
+global longlong njfl_period_end;
+global long njfl_progress;
+
+global long   njfl_pump_speed[NUMPUMPS];     // between 25 and 255
+global long   njfl_pump_direction[NUMPUMPS]; // 1: infuse, 2: withdraw
+global long   njfl_pump_volume[NUMPUMPS];    // total volume in us
+global long   njfl_pump_syringe[NUMPUMPS];   // list of syringes
+
+global double njfl_syringe_min[NUMSERINGES]; // ul/s 16 pumps, min (at speed 255/max)
+global double njfl_syringe_max[NUMSERINGES]; // ul/s 16 pumps, max (at speed 255)
+ 
+global long   njfl_curpump;                  // currently selected pump
+global long   njfl_cursyringe;
+
+// pump and seringe  names are only in the ini file
+
+global long njfl_cfg_dlg;
+global long njfl_cfg_pump;
+global long njfl_cfg_syringe;
+
+int main()
+{
+   if(!ExistProc("NKCP_OpenPort"))
+   {
+      RunMacro("c:/Program Files/NIS-Elements/macros/NkComPort.mac");
+   }
+   if(!ExistProc("NkDialog_Create"))
+   {
+      RunMacro("c:/Program Files/NIS-Elements/macros/Win32.mac");
+      RunMacro("c:/Program Files/NIS-Elements/macros/NkWindow.mac");
+   }
+   Get_Filename(FILE_CONFIG,njfl_profile);
+   njfl_RestoreSettings();
+
+   njfl_ShowDialog();
+}
+
+int njfl_StartPumpingVolume(long pump, long speed, long direction, double volume)
+{
+   long syringe;
+   double rate;
+   double period;
+   long tmp;
+   
+   syringe = njfl_pump_syringe[pump];
+   rate = speed; // convert speed to double
+   rate = njfl_syringe_max[syringe] * rate / 255.;
+   period = (volume / rate) + 0.5;
+   
+   tmp = period; // convert time to long
+   njfl_StartPumpingTime(pump, speed, direction,tmp);
+}
+
+int njfl_StartPumpingTime(long pump, long speed, long direction, long period)
+{
+   long shield;
+   long motor;
+   char command[64];
+   char * action;
+ 
+   shield = pump / 4 + 1;
+   motor = pump % 4 + 1;
+   
+   sprintf(command,"s%d%d%03d.","shield,motor,speed");
+   njfl_SendCommand(command);
+   sprintf(command,"r%d%d%d","shield,motor,direction");
+   njfl_AddPeriod(command,period);
+   njfl_SendCommand(command);
+   if(njfl_dlg)
+   {
+      if(direction == 1)
+      {
+         action = "infusing";
+      }
+      else
+      {
+         action = "withdrawing";
+      }
+      sprintf(command,"pump %d.%d %s for %d seconds at speed %d","shield,motor,action,period,speed");
+      njfl_SetStatus(command);
+      njfl_SetTimer(period,direction);
+   }
+}
+
+int njfl_WaitForCompletion()
+{
+   char buf[256];
+   char command[16];
+   int result;
+   int i;
+ 
+   strcpy(command,"g.");
+   Int_Query("NanoJ-Fluidics","Waiting for completion","Cancel");
+   result = 1; // still running;
+   //Int_Question("NanoJ-Fluidics","result",result,Int_QueryPressed,"","",0,0);
+   while(result && !Int_QueryPressed)
+   {
+      result = NkComPort_Write(njfl_handle,command,0);
+      result = NkComPort_ReadLine(njfl_handle,buf,256,100);
+      //Int_Question("NanoJ-Fluidics","motor status line",buf,"","","",0,0);
+      result = 0; // stopped
+      i = 0;
+      while(buf[i]) 
+      {
+         if(buf[i] == ',')
+         {
+            //Int_Question("NanoJ-Fluidics","motor status",buf[i+1],"","","",0,0);
+            if(buf[i+1] != '0')
+            {
+               result = 1; // still running
+            }
+         }
+         i = i + 1;
+      }
+      //Int_Question("NanoJ-Fluidics","result",result,"","","",0,0);
+      Wait(0.1);
+   }
+   Int_Query("","","");
+}
+
+int njfl_AddPeriod(char * str, long period)
+{
+   long digit;
+   char tmp[2];
+   if(period > 99999) period = 99999;
+   if(period < 1) period = 1;
+   
+   digit = period / 10000;
+   tmp[0] = digit + '0';
+   strcat(str,tmp);
+   period = period - (digit * 10000);
+   
+   digit = period / 1000;
+   tmp[0] = digit + '0';
+   strcat(str,tmp);
+   period = period - (digit * 1000);
+   
+   digit = period / 100;
+   tmp[0] = digit + '0';
+   strcat(str,tmp);
+   period = period - (digit * 100);
+   
+   digit = period / 10;
+   tmp[0] = digit + '0';
+   strcat(str,tmp);
+   period = period - (digit * 10);
+   
+   digit = period;
+   tmp[0] = digit + '0';
+   strcat(str,tmp);
+}
+
+int nfjl_StartPump(int pump)
+{
+   long speed;
+   double volume;
+   long direction;
+   
+   if(njfl_dlg && (pump == njfl_curpump))
+   {
+      // copy any changed settings from the dialog
+      njfl_GetRateVolumeDirection();
+   }
+   speed = njfl_pump_speed[pump];
+   volume = njfl_pump_volume[pump];
+   direction = njfl_pump_direction[pump];
+   njfl_StartPumpingVolume(pump,speed,direction,volume);
+}
+
+int njfl_OnStart()
+{
+   nfjl_StartPump(njfl_curpump);
+}
+
+int njfl_StopAllPumps()
+{
+   njfl_SendCommand("a.");
+   if(njfl_dlg)
+   {
+      KillTimer(njfl_progress,njfl_pb_dir);
+      njfl_SetStatus("pumps stopped");
+      if(njfl_pb_dir == 1)
+      {
+         NkWindow_PostMessage(njfl_progress,PBM_SETPOS,0,0);
+      }
+      else
+      {
+         NkWindow_PostMessage(njfl_progress,PBM_SETPOS,njfl_pb_range,0);
+      }
+   }
+}
+
+int njfl_SendCommand(char * command)
+{
+   char buf[4096];
+   char line[128];
+   char crnl[3];
+   long result = 1;
+   longlong wait_cursor;
+   longlong old_cursor;
+
+   wait_cursor = LoadCursorW(0,IDC_WAIT);
+   old_cursor = SetCursor(wait_cursor);
+   crnl[0] = 13;
+   crnl[1] = 10;
+   if(strlen(command)) 
+   {
+      strcat(buf,"> ");
+      strcat(buf,command);
+      strcat(buf,crnl);
+      result = NkComPort_Write(njfl_handle,command,0);
+      if(result < 0)
+      {
+         strcat(buf,"< ");
+         strcat(buf,"error sending command");
+         strcat(buf,crnl);
+      }
+   }
+   while(result > 0)
+   {
+      result = NkComPort_ReadLine(njfl_handle,line,128,200);
+      if(result > 0)
+      {
+         strcat(buf,"< ");
+         strcat(buf,line);
+         strcat(buf,crnl);
+      }
+   }
+   if(njfl_dlg)
+   {
+      njfl_AddLog(buf);
+   }
+   SetCursor(old_cursor);
+}
+
+int njfl_AddLog(char * text)
+{
+    long hCtrl;
+    long n1;
+    long n2;
+    n1 = strlen(njfl_log) + 1;
+    n2 = strlen(text) + 2;
+    if((n1 + n2) >= 2048)
+    {
+      strcpy(njfl_log,"");
+    }
+    strcat(njfl_log,text);
+    NkDialog_FindControl(njfl_dlg,"txtLog",&hCtrl);
+    NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,njfl_log);
+    NkWindow_SendMessage(hCtrl,EM_SETSEL,4096,4096);
+    NkWindow_SendMessage(hCtrl,EM_SCROLLCARET,0,0); 
+}
+
+int njfl_SetStatus(char * text)
+{
+    long hCtrl;
+    NkDialog_FindControl(njfl_dlg,"txtStatus",&hCtrl);
+    NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,text);
+}
+
+int njfl_SetTimer(long range, long direction)
+{
+   range = range * 10; // update 10x second
+   njfl_pb_range = range;
+   njfl_pb_dir = direction;
+   NkWindow_PostMessage(njfl_progress,PBM_SETRANGE32,0,range);
+   if(direction == 1)
+   {
+      NkWindow_PostMessage(njfl_progress,PBM_SETPOS,0,0);
+   }
+   else
+   {
+      NkWindow_PostMessage(njfl_progress,PBM_SETPOS,range,0);
+   }
+   range = range *  100; // from 1/10 s to ms
+   njfl_period_end = GetTickCount64() + range;
+   SetTimer(njfl_progress,njfl_pb_dir,100,NULL);
+}
+
+int njfl_RestoreSettings()
+{
+   int i;
+   char buf[2048];
+    
+   strcpy(buf,"");
+   Int_GetKeyString(njfl_profile,"NanoJ-Fluidics","dlg_top",buf,2048);
+   if(strlen(buf)) { njfl_dlg_top = atoi(buf); }
+   strcpy(buf,"");
+   Int_GetKeyString(njfl_profile,"NanoJ-Fluidics","dlg_left",buf,2048);
+   if(strlen(buf)) { njfl_dlg_left = atoi(buf); }
+ 
+   njfl_RestoreSyringes(0);
+
+   for(i = 0; i < NUMPUMPS; i = i + 1)
+   {
+      sprintf(buf,"speed%d","i");
+      njfl_pump_speed[i] = Int_GetKeyValue(njfl_profile,"NanoJ-Fluidics",buf,255);
+      sprintf(buf,"direction%d","i");
+      njfl_pump_direction[i] = Int_GetKeyValue(njfl_profile,"NanoJ-Fluidics",buf,1);
+      sprintf(buf,"syringe%d","i");
+      njfl_pump_syringe[i] = Int_GetKeyValue(njfl_profile,"NanoJ-Fluidics",buf,0);
+      sprintf(buf,"volume%d","i");
+      njfl_pump_volume[i] = Int_GetKeyValue(njfl_profile,"NanoJ-Fluidics",buf,1);
+   }
+   
+   njfl_curpump = Int_GetKeyValue(njfl_profile,"NanoJ-Fluidics","curpump",0);
+}
+
+int njfl_RestoreSyringes(int reset)
+{
+   njfl_RestoreSyringe( 0,"Peristaltic",  1.000,  0.250, reset);
+   njfl_RestoreSyringe( 1,"BD, 50 ml",   73.670, 18.417, reset);
+   njfl_RestoreSyringe( 2,"BD, 20 ml",   37.800,  9.450, reset);
+   njfl_RestoreSyringe( 3,"BD, 10 ml",   21.680,  5.420, reset);
+   njfl_RestoreSyringe( 4,"BD,  5 ml",   14.970,  3.743, reset);
+   njfl_RestoreSyringe( 5,"BD,  2 ml",    7.880,  1.971, reset);
+   njfl_RestoreSyringe( 6,"BD,  1 ml",    2.300,  0.575, reset);
+   njfl_RestoreSyringe( 7,"Terumo 60 ml",91.880, 22.970, reset);
+   njfl_RestoreSyringe( 8,"Terumo 30 ml",55.580, 13.896, reset);
+   njfl_RestoreSyringe( 9,"Terumo 20 ml",42.290, 10.573, reset);
+   njfl_RestoreSyringe(10,"Terumo 10 ml",26.000,  6.501, reset);
+   njfl_RestoreSyringe(11,"Terumo  5 ml",17.600,  4.401, reset);
+   njfl_RestoreSyringe(12,"Terumo  1 ml", 2.300,  0.575, reset);
+   njfl_RestoreSyringe(13,"Custom",       1.000,  0.250, reset);
+}  
+
+int njfl_RestoreSyringe(long i, char * default_name, double default_max, double default_min, int reset)
+{
+   char buf[64];
+   char key[64];
+   double val;
+   
+   sprintf(key,"syringe_name%d","i");
+   strcpy(buf,"");
+   if(!reset)
+   {
+      Int_GetKeyString(njfl_profile,"NanoJ-Fluidics",key,buf,64);
+   }
+   if(!strlen(buf)) Int_SetKeyString(njfl_profile,"NanoJ-Fluidics",key,default_name);
+   
+   sprintf(key,"syringe_max%d","i");
+   val = default_max;
+   if(!reset)
+   {
+      val = Int_GetKeyValue(njfl_profile,"NanoJ-Fluidics",key,default_max);
+   }
+   if(val < 0.1) val = 0.1;
+   njfl_syringe_max[i] = val; 
+
+   sprintf(key,"syringe_min%d","i");
+   val = default_min;
+   if(!reset)
+   {
+      val = Int_GetKeyValue(njfl_profile,"NanoJ-Fluidics",key,default_min);
+   }
+   if(val < 0.001) val = 0.001; 
+   if(val > (njfl_syringe_max[i]/2)) val = (njfl_syringe_max[i]/2); 
+   njfl_syringe_min[i] = val;
+}
+
+int njfl_StoreSettings()
+{
+   char buf[2048];
+   long r2,b2;
+   int i;
+   
+   for(i = 0; i < NUMPUMPS; i = i + 1)
+   {
+      sprintf(buf,"speed%d","i");
+      Int_SetKeyValue(njfl_profile,"NanoJ-Fluidics",buf,njfl_pump_speed[i]);
+      sprintf(buf,"direction%d","i");
+      Int_SetKeyValue(njfl_profile,"NanoJ-Fluidics",buf,njfl_pump_direction[i]);
+      sprintf(buf,"syringe%d","i");
+      Int_SetKeyValue(njfl_profile,"NanoJ-Fluidics",buf,njfl_pump_syringe[i]);
+      sprintf(buf,"volume%d","i");
+      Int_SetKeyValue(njfl_profile,"NanoJ-Fluidics",buf,njfl_pump_volume[i]);
+   }
+   
+   NkWindow_GetWindowRect(njfl_dlg,&njfl_dlg_left,&njfl_dlg_top,&r2,&b2);
+   sprintf(buf,"%d","njfl_dlg_left");
+   Int_SetKeyString(njfl_profile,"NanoJ-Fluidics","dlg_left",buf);
+   sprintf(buf,"%d","njfl_dlg_top");
+   Int_SetKeyString(njfl_profile,"NanoJ-Fluidics","dlg_top",buf);
+}
+
+int njfl_OpenPort(char * p)
+{
+   char port[64];
+   long result = 1;
+   
+   strcpy(port,p);
+   if(!strlen(p))
+   {
+      strcpy(port,njfl_port);
+      result = NkComPort_SelectPortDialog(njfl_dlg,"NanoJ-Fluidics",port,64);
+   }
+   if(result)
+   {
+      NkComPort_Close(njfl_port);
+      if(NKCP_OpenPort(&njfl_handle,port,"NanoJ-Fluidics",njfl_dlg))
+      {
+         strcpy(njfl_port,port);
+         Int_SetKeyString(njfl_profile,"NanoJ-Fluidics","port",njfl_port);
+         Wait(1.5); // the Arduino needs time to boot !
+         njfl_SendCommand("");
+      }
+   }
+   if(NkComPort_IsConnected(njfl_handle))
+   {
+      njfl_SetStatus("connected");
+   }
+   else
+   {
+      njfl_SetStatus("no connection");
+   }
+}
+
+int njfl_OpenPreviousPort()
+{
+   char port[64];
+   Int_GetKeyString(njfl_profile,"NanoJ-Fluidics","port",port,64);
+   njfl_OpenPort(port);
+}
+
+int njfl_OnPort()
+{
+   njfl_OpenPort("");   
+}
+
+int njfl_OnDisconnect()
+{
+   NkComPort_Close(&njfl_handle);
+   njfl_SetStatus("no connection");
+}
+
+int njfl_ShowDialog()
+{
+   long hNis;
+   long hDlg;
+   long hCtrl;
+   long i;
+   char name[64];
+   char buf[64];
+
+   if(njfl_dlg)
+   {
+      NkWindow_ShowWindow(njfl_dlg,1);
+   }
+   else
+   {
+      NkWindow_GetMainWindow("NIS-Elements","lxMDIClient",&hNis);
+      if(hNis == 0) { Int_Question("NanoJ-Fluidics","Failed to find NIS window","Close","","","",0,0); return 0; }
+
+      NkDialog_Create(hNis,"NanoJ-Fluidics",&hDlg);
+      njfl_dlg = hDlg;
+      NkDialog_AddRemoveOptions(hDlg,0,NKD_AUTONEXTROW);
+      NkDialog_AddMacroMessageHandler(hDlg,"",WM_CLOSE,0,0,0,0,"njfl_OnClose();");
+      //NkDialog_AddMacroMessageHandler(hDlg,"",WM_TIMER,0,0,0,0,"njfl_OnTimer();");
+      
+      NkDialog_AddColumn(hDlg);
+      NkDialog_AddControl(hDlg,"lbPump","static",SS_SIMPLE,0,75,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"Pump:");
+      NkDialog_AddControl(hDlg,"cbPump","combobox",CBS_DROPDOWNLIST,80,155,&hCtrl);
+      NkDialog_AddMacroMessageHandler(hDlg,"cbPump",WM_COMMAND,CBN_SELENDOK,0,0,0,"njfl_OnPump();");
+      njfl_InitPumps();
+      
+      NkDialog_AddRow(hDlg);
+      NkDialog_AddControl(hDlg,"lbSyringe","static",SS_SIMPLE,0,75,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"Syringe:");
+      NkDialog_AddControl(hDlg,"cbSyringe","combobox",CBS_DROPDOWNLIST,80,155,&hCtrl);
+      NkDialog_AddMacroMessageHandler(hDlg,"cbSyringe",WM_COMMAND,CBN_SELENDOK,0,0,0,"njfl_OnSyringe();");
+      njfl_InitSyringes();
+     
+      NkDialog_AddRow(hDlg);
+      NkDialog_AddControl(hDlg,"lbRate","static",SS_SIMPLE,0,75,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"Rate (ul/s)  :");
+      NkDialog_AddControlEx(hDlg,"txtRate","NkLsEdit",ES_RIGHT+ES_MULTILINE+ES_AUTOHSCROLL+ES_AUTOVSCROLL+ES_WANTRETURN,WS_EX_CLIENTEDGE,80,50,&hCtrl);
+      NkDialog_AddMacroMessageHandler(hDlg,"txtRate",WM_COMMAND,0,0,0,0,"njfl_OnRate();");
+      NkLsEdit_SetRange(hCtrl,25,255,1);
+      NkLsEdit_SetFormat(hCtrl,"%.2lf");
+      NkLsEdit_SetUnit(hCtrl," ul");
+      NkLsEdit_SetFlags(hCtrl,NKSLE_NODRAGNOTIFY_FLAG);
+      NkDialog_AddControl(hDlg,"sbRate","NkLsScrollbar",SBS_HORZ,135,100,NULL);
+
+      NkDialog_AddRow(hDlg);
+      NkDialog_AddControl(hDlg,"lbVolume","static",SS_SIMPLE,0,75,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"Target Volume:");
+      NkDialog_AddControlEx(hDlg,"txtVolume","NkLsEdit",ES_RIGHT+ES_MULTILINE+ES_AUTOHSCROLL+ES_AUTOVSCROLL+ES_WANTRETURN,WS_EX_CLIENTEDGE,80,140,&hCtrl);
+      NkLsEdit_SetRange(hCtrl,1,50000000,0.01);
+      NkLsEdit_SetFormat(hCtrl,"%.2lf");
+      NkLsEdit_SetUnit(hCtrl," ul");
+
+      NkDialog_AddRow(hDlg);
+      NkDialog_AddControl(hDlg,"lbDirection","static",SS_SIMPLE,0,75,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"Direction:");
+      NkDialog_AddControl(hDlg,"cbDirection","combobox",CBS_DROPDOWNLIST,80,155,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,CB_ADDSTRING,0,"Infuse");
+      NkWindow_SendMessageString(hCtrl,CB_ADDSTRING,0,"Withdraw");
+
+      NkDialog_AddRow(hDlg);
+      NkDialog_AddControl(hDlg,"pgbProgress","NkProgressbar",1,1,235,&hCtrl);
+      njfl_progress = hCtrl;
+      NkDialog_AddRow(hDlg);
+      NkDialog_AddControl(hDlg,"txtStatus","edit",ES_READONLY+ES_MULTILINE+ES_AUTOHSCROLL+ES_AUTOVSCROLL,1,235,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"");
+      NkProgressBar_SetCompletionText(njfl_progress,hCtrl,"done");
+      NkDialog_AddRow(hDlg);
+      NkDialog_AddControl(hDlg,"txtLog","edit",WS_VSCROLL+WS_BORDER+ES_MULTILINE+ES_AUTOHSCROLL+ES_AUTOVSCROLL+ES_READONLY,-4,235,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"");
+
+      NkDialog_AddColumn(hDlg);
+      NkDialog_AddRemoveOptions(hDlg,NKD_AUTONEXTROW,0);
+      NkDialog_AddControl(hDlg,"btnPort","button",BS_PUSHBUTTON,0,60,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"Connect");
+      NkDialog_AddMacroMessageHandler(hDlg,"btnPort",WM_COMMAND,0,0,0,0,"njfl_OnPort();");
+      NkDialog_AddControl(hDlg,"btnDisconnect","button",BS_PUSHBUTTON,0,60,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"Disconnect");
+      NkDialog_AddMacroMessageHandler(hDlg,"btnDisconnect",WM_COMMAND,0,0,0,0,"njfl_OnDisconnect();");
+      NkDialog_AddControl(hDlg,"btnSetup","button",BS_PUSHBUTTON,0,60,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"Setup");
+      NkDialog_AddMacroMessageHandler(hDlg,"btnSetup",WM_COMMAND,0,0,0,0,"njfl_OnSetup();");
+      NkDialog_AddControl(hDlg,"txtSpacer","edit",ES_READONLY,0,60,&hCtrl);
+      NkDialog_AddControl(hDlg,"btnStart","button",BS_PUSHBUTTON,0,60,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"Start");
+      NkDialog_AddMacroMessageHandler(hDlg,"btnStart",WM_COMMAND,0,0,0,0,"njfl_OnStart();");
+      NkDialog_AddControl(hDlg,"btnStop","button",BS_PUSHBUTTON,0,60,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"Stop");
+      NkDialog_AddMacroMessageHandler(hDlg,"btnStop",WM_COMMAND,0,0,0,0,"njfl_StopAllPumps();");
+      
+      njfl_OnSetPumpSettings();
+      njfl_PositionDialog(hNis,hDlg);
+      NkWindow_ShowWindow(njfl_dlg,1);
+      njfl_OpenPreviousPort();
+   }
+}
+
+int njfl_InitPumps()
+{
+   long hCtrl;
+   int i;
+   char buf[64];
+   char key[64];
+   int shield;
+   int motor;
+   
+   NkDialog_FindControl(njfl_dlg,"cbPump",&hCtrl);
+   NkWindow_SendMessage(hCtrl,CB_RESETCONTENT,0,0);
+   for(i = 0; i < NUMPUMPS; i = i + 1)
+   {
+      sprintf(key,"name%d","i");
+      strcpy(buf,"");
+      Int_GetKeyString(njfl_profile,"NanoJ-Fluidics",key,buf,64);
+      shield = (i / 4);
+      motor = i - (shield * 4) + 1;
+      shield = shield + 1;
+      sprintf(key,"P%d.%d %s","shield,motor,buf");
+      NkWindow_SendMessageString(hCtrl,CB_ADDSTRING,0,key);
+      if(i == njfl_curpump) NkWindow_SendMessageString(hCtrl,CB_SETCURSEL,i,0);
+   }
+}
+
+int njfl_InitSyringes()
+{
+   long hCtrl;
+   int i;
+   char buf[64];
+   char key[64];
+
+   NkDialog_FindControl(njfl_dlg,"cbSyringe",&hCtrl);
+   NkWindow_SendMessage(hCtrl,CB_RESETCONTENT,0,0);
+   for(i = 0; i < NUMSERINGES; i = i + 1)
+   {
+      sprintf(key,"syringe_name%d","i");
+      Int_GetKeyString(njfl_profile,"NanoJ-Fluidics",key,buf,64);
+      NkWindow_SendMessageString(hCtrl,CB_ADDSTRING,0,buf);
+      if(i == njfl_cursyringe) NkWindow_SendMessageString(hCtrl,CB_SETCURSEL,i,0);
+   }
+}
+
+int njfl_OnPump()
+{
+   njfl_GetRateVolumeDirection();
+   njfl_OnSetPumpSettings();
+}
+
+int njfl_GetRateVolumeDirection()
+{
+   njfl_OnRate();
+   njfl_OnVolume();
+   njfl_OnDirection();
+}
+
+int njfl_OnSetPumpSettings()
+{
+   long hCtrl;
+   long cursel;
+   double lVal;
+
+   NkDialog_FindControl(njfl_dlg,"cbPump",&hCtrl);
+   cursel = NkWindow_SendMessage(hCtrl,CB_GETCURSEL,0,0);
+   if(cursel < 0) cursel = 0;
+   njfl_curpump = cursel;
+
+   NkDialog_FindControl(njfl_dlg,"cbSyringe",&hCtrl);
+   cursel = njfl_pump_syringe[njfl_curpump];
+   NkWindow_SendMessage(hCtrl,CB_SETCURSEL,cursel,0);
+   
+   njfl_OnSyringe();
+   
+   NkDialog_FindControl(njfl_dlg,"txtVolume",&hCtrl);
+   lVal = njfl_pump_volume[njfl_curpump];
+   NkLsEdit_SetValue(hCtrl,lVal);
+   
+   NkDialog_FindControl(njfl_dlg,"cbDirection",&hCtrl);
+   cursel = njfl_pump_direction[njfl_curpump] - 1;
+   NkWindow_SendMessage(hCtrl,CB_SETCURSEL,cursel,0);
+}
+
+int njfl_OnSyringe()
+{
+   long hCtrl;
+   double scale;
+   double higher;
+   double lower;
+   long speed;
+
+   NkDialog_FindControl(njfl_dlg,"cbSyringe",&hCtrl);
+   njfl_cursyringe = NkWindow_SendMessage(hCtrl,CB_GETCURSEL,0,0);
+   if(njfl_pump_syringe[njfl_curpump] != njfl_cursyringe)
+   {
+      njfl_pump_syringe[njfl_curpump] = njfl_cursyringe;
+   }
+   
+   NkDialog_FindControl(njfl_dlg,"txtRate",&hCtrl);
+   higher = 255.;
+   scale = njfl_syringe_max[njfl_cursyringe] / higher;
+   lower = 255. * njfl_syringe_min[njfl_cursyringe] / njfl_syringe_max[njfl_cursyringe];
+   NkLsEdit_SetRange(hCtrl,lower,higher,1.0);
+   NkLsEdit_SetScale(hCtrl,scale,0.0);
+   speed = njfl_pump_speed[njfl_curpump];
+   NkLsEdit_SetValue(hCtrl,speed);
+}
+
+int njfl_OnRate()
+{
+   long hCtrl;
+   long speed;
+   double rate;
+   
+   NkDialog_FindControl(njfl_dlg,"txtRate",&hCtrl);
+   speed = NkLsEdit_GetValue(hCtrl) + 0.5;
+   if(speed < 1) speed = 1;
+   if(speed > 255) speed = 255;
+   njfl_pump_speed[njfl_curpump] = speed;
+ 
+   // 1 second is the lowest we can do
+   rate = speed;
+   rate = njfl_syringe_max[njfl_cursyringe] * rate / 255.;
+   NkDialog_FindControl(njfl_dlg,"txtVolume",&hCtrl);
+   NkLsEdit_SetRange(hCtrl,rate,2147483647,0.01);
+}
+
+int njfl_OnVolume()
+{
+   long hCtrl;
+   double lVal;
+   NkDialog_FindControl(njfl_dlg,"txtVolume",&hCtrl);
+   lVal = NkLsEdit_GetValue(hCtrl);
+   njfl_pump_volume[njfl_curpump] = lVal;
+}
+
+int njfl_OnDirection()
+{
+   long hCtrl;
+   double lVal;
+   long cursel;
+   NkDialog_FindControl(njfl_dlg,"cbDirection",&hCtrl);
+   cursel = NkWindow_SendMessage(hCtrl,CB_GETCURSEL,0,0);
+   njfl_pump_direction[njfl_curpump] = cursel + 1;
+}
+
+int njfl_PositionDialog(long hNis, long hDlg)
+{
+   int dt_left;
+   int dt_top;
+   int dt_width;
+   int dt_height; 
+   int dlg_x_max;
+   int dlg_y_max;
+   int dlg_width;
+   int dlg_height;
+   dt_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+   dt_top =  GetSystemMetrics(SM_YVIRTUALSCREEN);
+   dt_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+   dt_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+   NkWindow_GetWindowSize(hDlg,&dlg_width,&dlg_height);
+   if((njfl_dlg_top == -1) || (njfl_dlg_left == -1))
+   {
+      njfl_dlg_left = dt_left + ((dt_width  - dlg_width ) / 2);
+      njfl_dlg_top  = dt_top  + ((dt_height - dlg_height) / 2);
+   }
+   else
+   {
+      if(njfl_dlg_left < dt_left) { njfl_dlg_left = dt_left; }
+      if(njfl_dlg_top  < dt_top ) { njfl_dlg_top  = dt_top; }
+      dlg_x_max = dt_left + dt_width - dlg_width;
+      dlg_y_max = dt_top + dt_height - dlg_height;
+      if(njfl_dlg_left > dlg_x_max) { njfl_dlg_left  = dlg_x_max; }
+      if(njfl_dlg_top  > dlg_y_max) { njfl_dlg_top   = dlg_y_max; }
+   }
+   NkWindow_SetWindowPos(hDlg,njfl_dlg_left,njfl_dlg_top);
+}
+
+int njfl_OnClose()
+{
+   njfl_OnCancel();
+}
+
+int njfl_OnCancel()
+{
+   if(njfl_dlg)
+   {
+      njfl_StoreSettings();
+      NkWindow_ShowWindow(njfl_dlg,0);
+      if(GetKeyState(VK_RCONTROL) < 0)
+      {
+         NkWindow_DestroyWindow(njfl_dlg);
+         njfl_dlg = 0;
+      }
+   }
+}
+
+int njfl_OnSetup()
+{
+   long hDlg;
+   long hCtrl;
+   long style;
+   char buf[64];
+   long tmp;
+   
+   if(njfl_cfg_dlg)
+   {
+      NkWindow_ShowWindow(njfl_cfg_dlg,1);
+      return 1;
+   }
+   else
+   {
+      if(njfl_dlg == 0) { Int_Question("NanoJ-Fluidics","Please run njfl_ShowDialog(); first.","Close","","","",0,0); return 0; }
+
+      NkDialog_Create(njfl_dlg,"NanoJ-Fluidics",&hDlg);
+      NkDialog_AddMacroMessageHandler(hDlg,"",16,0,0,0,0,"njfl_cfg_OnClose();");
+      NkDialog_AddRemoveOptions(hDlg,0,NKD_AUTONEXTROW);
+      
+      NkDialog_AddColumn(hDlg);
+      NkDialog_FindControl(njfl_dlg,"cbPump",&hCtrl);
+      njfl_cfg_pump = NkWindow_SendMessage(hCtrl,CB_GETCURSEL,0,0);
+      NkWindow_SendMessageString(hCtrl,CB_GETLBTEXT,njfl_cfg_pump,buf);
+      NkDialog_AddControl(hDlg,"lbPumpName","static",SS_SIMPLE,0,75,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"Pump Name:");
+      NkDialog_AddControlEx(hDlg,"txtPumpName","edit",ES_AUTOHSCROLL,WS_EX_CLIENTEDGE,80,160,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,buf+5);     
+      
+      NkDialog_AddRow(hDlg);
+      NkDialog_FindControl(njfl_dlg,"cbSyringe",&hCtrl);
+      njfl_cfg_syringe = NkWindow_SendMessage(hCtrl,CB_GETCURSEL,0,0);
+      NkWindow_SendMessageString(hCtrl,CB_GETLBTEXT,njfl_cfg_syringe,buf);
+      NkDialog_AddControl(hDlg,"lbSyringeName","static",SS_SIMPLE,0,75,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"Syringe Name:");
+      NkDialog_AddControlEx(hDlg,"txtSyringeName","edit",ES_AUTOHSCROLL,WS_EX_CLIENTEDGE,80,160,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,buf);     
+      
+      NkDialog_AddRow(hDlg);
+      NkDialog_AddControl(hDlg,"lbMax","static",SS_SIMPLE,0,75,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"Maximal Rate:");
+      NkDialog_AddControlEx(hDlg,"txtMax","NkLsEdit",ES_RIGHT+ES_MULTILINE+ES_AUTOHSCROLL+ES_AUTOVSCROLL+ES_WANTRETURN,WS_EX_CLIENTEDGE,80,100,&hCtrl);
+      NkLsEdit_SetRange(hCtrl,0.001,2147483647,0.01);
+      NkLsEdit_SetFormat(hCtrl,"%.2lf");
+      NkLsEdit_SetUnit(hCtrl," ul/10s");
+      NkLsEdit_SetValue(hCtrl,njfl_syringe_max[njfl_cfg_syringe]*10.);
+      NkDialog_AddControl(hDlg,"btnTestMax","button",BS_PUSHBUTTON,190,50,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"Test");
+      NkDialog_AddMacroMessageHandler(hDlg,"btnTestMax",WM_COMMAND,0,0,0,0,"njfl_TestMax();");
+
+      NkDialog_AddRow(hDlg);
+      NkDialog_AddControl(hDlg,"lbMin","static",SS_SIMPLE,0,75,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"Minimal Rate:");
+      NkDialog_AddControlEx(hDlg,"txtMin","NkLsEdit",ES_RIGHT+ES_MULTILINE+ES_AUTOHSCROLL+ES_AUTOVSCROLL+ES_WANTRETURN,WS_EX_CLIENTEDGE,80,100,&hCtrl);
+      NkLsEdit_SetRange(hCtrl,0.001,50000000,0.01);
+      NkLsEdit_SetFormat(hCtrl,"%.2lf");
+      NkLsEdit_SetUnit(hCtrl," ul/10s");
+      NkLsEdit_SetValue(hCtrl,njfl_syringe_min[njfl_cfg_syringe]*10.);
+      NkDialog_AddControl(hDlg,"btnTestMin","button",BS_PUSHBUTTON,190,50,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"Test");
+      NkDialog_AddMacroMessageHandler(hDlg,"btnTestMin",WM_COMMAND,0,0,0,0,"njfl_TestMin();");
+
+      NkDialog_AddRow(hDlg);
+      NkDialog_AddControl(hDlg,"btnOK","button",BS_PUSHBUTTON,190,50,&hCtrl);
+      NkWindow_SendMessageString(hCtrl,WM_SETTEXT,0,"OK");
+      NkDialog_AddMacroMessageHandler(hDlg,"btnOK",WM_COMMAND,0,0,0,0,"njfl_cfg_OnOK();");
+
+      njfl_cfg_dlg = hDlg;
+      NkWindow_ShowWindow(njfl_cfg_dlg,1);
+   }
+}
+
+int njfl_TestMax()
+{
+   //long direction;
+   njfl_OnDirection();
+   //direction = njfl_pump_direction[njfl_cfg_pump];
+   njfl_StartPumpingTime(njfl_cfg_pump,255,TESTDIRECTION,10);
+}
+
+int njfl_TestMin()
+{
+   long hCtrl;
+   double max;
+   double min;
+   double ratio;
+   
+   long speed;
+   //long direction;
+   
+   NkDialog_FindControl(njfl_cfg_dlg,"txtMax",&hCtrl);
+   max = NkLsEdit_GetValue(hCtrl);
+   NkDialog_FindControl(njfl_cfg_dlg,"txtMin",&hCtrl);
+   min = NkLsEdit_GetValue(hCtrl);
+   ratio = min/max;
+   speed = ratio * 255.;
+ 
+   njfl_OnDirection();
+   //direction = njfl_pump_direction[njfl_cfg_pump];
+   njfl_StartPumpingTime(njfl_cfg_pump,speed,TESTDIRECTION,10);
+}
+
+int njfl_cfg_OnClose()
+{
+   return njfl_cfg_OnCancel();
+}
+
+int njfl_cfg_OnCancel()
+{
+   long r;
+   NkWindow_DestroyWindow(njfl_cfg_dlg);
+   njfl_cfg_dlg = 0;
+   if(GetKeyState(VK_RCONTROL) < 0)
+   {
+      r = Int_Question("NanoJ-Fluidics","Do you really want to reset all calibrations ?","Yes","No","","",0,0);
+      if(r == 1)
+      {
+         njfl_RestoreSyringes(1);
+         njfl_InitSyringes();
+         njfl_OnPump();
+      }
+   }
+}
+
+int njfl_cfg_OnOK()
+{
+   long hCtrl;
+   char buf[64];
+   char key[64];
+   double dVal;
+
+   NkDialog_FindControl(njfl_cfg_dlg,"txtPumpName",&hCtrl);
+   NkWindow_SendMessageString(hCtrl,WM_GETTEXT,64,buf);
+   sprintf(key,"name%d","njfl_cfg_pump");
+   Int_SetKeyString(njfl_profile,"NanoJ-Fluidics",key,buf);
+   
+   NkDialog_FindControl(njfl_cfg_dlg,"txtSyringeName",&hCtrl);
+   NkWindow_SendMessageString(hCtrl,WM_GETTEXT,64,buf);
+   sprintf(key,"syringe_name%d","njfl_cfg_syringe");
+   Int_SetKeyString(njfl_profile,"NanoJ-Fluidics",key,buf);
+
+   NkDialog_FindControl(njfl_cfg_dlg,"txtMax",&hCtrl);
+   dVal = NkLsEdit_GetValue(hCtrl)/10.;
+   njfl_syringe_max[njfl_cfg_syringe] = dVal;
+   sprintf(key,"syringe_max%d","njfl_cfg_syringe");
+   Int_SetKeyValue(njfl_profile,"NanoJ-Fluidics",key,dVal);
+
+   NkDialog_FindControl(njfl_cfg_dlg,"txtMin",&hCtrl);
+   dVal = NkLsEdit_GetValue(hCtrl)/10.;
+   njfl_syringe_min[njfl_cfg_syringe] = dVal;
+   sprintf(key,"syringe_min%d","njfl_cfg_syringe");
+   Int_SetKeyValue(njfl_profile,"NanoJ-Fluidics",key,dVal);
+   
+   njfl_InitPumps();
+   njfl_InitSyringes();
+   njfl_OnSyringe();
+   
+   njfl_cfg_OnCancel();
+   //njfl_StoreSettings();
+   //NkWindow_DestroyWindow(njfl_dlg);
+   //njfl_dlg = 0;
+   //njfl_ShowDialog();
+}
+ 
