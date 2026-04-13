@@ -19,3 +19,24 @@ CYCLOPS integrates:
 ---
 
 ## Repository Structure
+
+---
+
+## License
+
+Code: MIT License  
+Hardware: CERN-OHL-S (or CC BY 4.0)
+
+---
+
+## Citation
+
+If you use this work, please cite:
+
+[Your paper citation]
+
+---
+
+## Contact
+
+For questions or issues, please open a GitHub issue.
