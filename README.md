@@ -20,6 +20,13 @@ CYCLOPS integrates:
 
 ## Repository Structure
 
+hardware/ → STL and CAD files for stage insert
+arduino_control/ → Pump control code (.ino) and wiring diagram
+cyclic_imaging/ → Imaging scripts and configuration files
+image_preprocessing/ → ImageJ macros / scripts for correction and alignment
+image_analysis/ → Segmentation (Cellpose), QuPath extraction, FlowJo gating, R scripts
+example_data/ → Small demo dataset
+docs/ → Setup instructions and troubleshooting
 ---
 
 ## License
