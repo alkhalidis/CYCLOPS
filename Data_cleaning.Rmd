@@ -1,0 +1,52 @@
+---
+title: "CODEX_23_R25_tumour"
+author: "Sarwah Al-Khalidi"
+date: "2023-11-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+
+```
+
+
+```{r}
+
+raw_data=read_csv("../4_project/measurements_250612.csv")
+
+TMA=raw_data %>% 
+  dplyr::select("Image",`Object ID`, "Parent", "Centroid X µm", "Centroid Y µm", "Area µm^2", "Length µm", "Circularity", "Solidity", "Max diameter µm", "Min diameter µm", contains("Mean")) %>% #add or remove parameters to retain as required
+  dplyr::rename_all(funs(str_replace_all(.,c(" "="_","(:.*)"="_Mean", "_µm(.*)"="" )))) %>% 
+  group_by(Image) %>% 
+  dplyr::mutate(ID1=cur_group_id(),
+                ID2= 1:n(),
+                ID2=stringr::str_pad(ID2, 5, side = "left", pad = 0)) %>% #padd value depends on the number of digits the maximum value of ID2 has
+  ungroup() %>% 
+  unite(Cell_ID, c(ID1,ID2), sep = "", remove = T)
+
+data_norm=TMA%>% 
+  transform(Cell_ID1=as.numeric( substr(Cell_ID,1,3)), Cell_ID2=as.numeric(substr(Cell_ID,4,9))) %>% 
+  mutate(across(contains("Mean"), ~c(scale(.)))) %>% 
+  mutate(across(contains("Mean"), asinh))
+
+
+
+sample_ID=unique(TMA$Image)
+
+
+for (i in sample_ID) {
+  s1=data_norm %>% 
+    dplyr::filter(Image==i)%>% 
+    dplyr::select(contains("Cell_ID"), contains("Mean"), contains("Centroid"))
+  
+  write_csv(s1, paste0("ForFlowJo/", i, ".csv") )
+  
+}
+
+```
+
+
+
