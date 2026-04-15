@@ -1,7 +1,7 @@
 ---
-title: "CODEX_23_R25_tumour"
+title: "CYCLOPS data cleaning"
 author: "Sarwah Al-Khalidi"
-date: "2023-11-22"
+date: "2026-04-15"
 output: html_document
 ---
 
@@ -15,7 +15,7 @@ library(tidyverse)
 
 ```{r}
 
-raw_data=read_csv("../4_project/measurements_250612.csv")
+raw_data=read_csv("measurements.csv")
 
 TMA=raw_data %>% 
   dplyr::select("Image",`Object ID`, "Parent", "Centroid X µm", "Centroid Y µm", "Area µm^2", "Length µm", "Circularity", "Solidity", "Max diameter µm", "Min diameter µm", contains("Mean")) %>% #add or remove parameters to retain as required
