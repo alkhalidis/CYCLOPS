@@ -70,6 +70,23 @@ def filter_image(image, downsample=10, filter_size=(10,10)):
     filtered_image = median_filter(resized_image, size=filter_size)
     resized_image = cv2.resize(filtered_image, (image.shape[1],image.shape[0]))
     return resized_image
+
+def artefact_correction(images, patch_size=924, offset=0, fixed_offset=0, tissue_fraction=0.9, downsample=10, radius=5, dapi_channel=0):
+    filtered_images = [filter_image(im[dapi_channel], downsample=downsample) for im in tqdm(images)]
+    otsu_image_masks = [keep_largest_object(filtered_image>=threshold_otsu(filtered_image)) for filtered_image in tqdm(filtered_images)]
+    full_norm = calculate_normalising_image(images, otsu_image_masks, patch_size, offset=offset, fixed_offset=fixed_offset, tissue_fraction=tissue_fraction, dapi_channel=dapi_channel)
+    out_image_list = [im/full_norm for im in tqdm(images)]
+    return out_image_list
+
+def find_cell_nuc_masks(images, cyt_channels, downsample=10, radius=5, dapi_channel=0, nfat_channel=11):
+    filtered_images = [filter_image(im[dapi_channel], downsample=downsample) for im in tqdm(images)]
+    otsu_image_masks = [keep_largest_object(filtered_image>=threshold_otsu(filtered_image)) for filtered_image in tqdm(filtered_images)]
+    mask_list = [find_local_mask(out_image, cyt_channels, radius=radius) for out_image in tqdm(images)]
+    masked_full_images = [otsu_image_masks[i]*im for i, im in tqdm(enumerate(images))]
+    cell_masks = [(1-mask)*otsu_image_masks[i] for i, mask in tqdm(enumerate(mask_list))]
+    cyt_list = [images[i][nfat_channel]*(1-cell_masks[i]) for i in range(len(images))]
+    nuc_list = [images[i][nfat_channel]*cell_masks[i] for i in range(len(images))]
+    return masked_full_images, cell_masks, nuc_list, cyt_list, mask_list
  
 def process_images(images, cyt_channels, patch_size=924, offset=0, fixed_offset=0, tissue_fraction=0.9, downsample=10, radius=5, dapi_channel=0, nfat_channel=11):
     filtered_images = [filter_image(im[dapi_channel], downsample=downsample) for im in tqdm(images)]
@@ -84,21 +101,3 @@ def process_images(images, cyt_channels, patch_size=924, offset=0, fixed_offset=
     cyt_list = [out_image_list[i][nfat_channel]*(1-cell_masks[i]) for i in range(len(out_image_list))]
     nuc_list = [out_image_list[i][nfat_channel]*cell_masks[i] for i in range(len(out_image_list))]
     return masked_full_images, cell_masks, nuc_list, cyt_list, mask_list
- 
-PATCH_SIZE=924
-OFFSET=0
-FIXED_OFFSET=0
-TISSUE_FRACTION = 0.9
-DOWNSAMPLE = 10
-RADIUS = 5
-DAPI_CHANNEL = 0
-NFAT_CHANNEL = 11
- 
-# cyt_channels = [5,6,7,8,9,12,16,17,20]
-cyt_channels = [5,6,4,8,9,11,15,16,19]
- 
-conditions = [("Sample1",i) for i in range(3,4)]+[("Sample2",i) for i in range(3,4)]+[("Sample3",i) for i in range(3,4)]+[("Sample4",i) for i in range(3,4)]+[("Sample5",i) for i in range(3,4)]
-names = [condition+'_'+str(repeat) for condition, repeat in conditions]
- 
-images = [tifffile.imread(f"/beatson/R24/Lucas/CODEX/TMA011_2/codex_24_r02_tma011_ccr7_2_{condition}_{repeat}.tif") for condition, repeat in conditions]
-masked_full_images, cell_masks, nuc_list, cyt_list, tissue_masks = process_images(images, patch_size=PATCH_SIZE, offset=OFFSET, fixed_offset=FIXED_OFFSET, tissue_fraction=TISSUE_FRACTION, downsample=DOWNSAMPLE, radius=RADIUS, dapi_channel=DAPI_CHANNEL, nfat_channel=NFAT_CHANNEL)
