@@ -10,9 +10,9 @@ gs <- cyto_setup(path = "fcs", gatingTemplate =( "gatingTemplate.csv"),
                  truncate_max_range = FALSE)
 
 #Uncomment and run the following if continuing gating from a previously saved gatingTemplate
-#cyto_gatingTemplate_apply(gs, gatingTemplate = "gatingTemplate.csv") 
+cyto_gatingTemplate_apply(gs, gatingTemplate = "gatingTemplate.csv") 
 
-cyto_gate_edit(gs,
+cyto_gate_draw(gs,
                parent = "root",
                alias = #"LEC",
                #"BEC",
@@ -33,7 +33,7 @@ cyto_gate_draw(gs,
                ylim = c(-1, 4),
                gatingTemplate = "gatingTemplate.csv")
 
-cyto_gate_edit(gs,
+cyto_gate_draw(gs,
                parent = "FC",
                alias = "FBC",
                  #"FDC",
@@ -54,7 +54,7 @@ cyto_gate_draw(gs,
                ylim = c(-1, 2),
                gatingTemplate = "gatingTemplate.csv")
 
-cyto_gate_edit(gs,
+cyto_gate_draw(gs,
                parent = "Tcells",
                alias = #"Treg",
                  "nonTreg",
@@ -64,7 +64,7 @@ cyto_gate_edit(gs,
                ylim = c(-1, 4),
                gatingTemplate = "gatingTemplate.csv")
 
-cyto_gate_edit(gs,
+cyto_gate_draw(gs,
                parent = "nonTreg",
                alias = "CD8",
                #"CD4",
@@ -104,7 +104,7 @@ cyto_gate_draw(gs,
                ylim = c(-1.5, 3.5),
                gatingTemplate = "gatingTemplate.csv")
 
-cyto_gate_edit(gs,
+cyto_gate_draw(gs,
                 parent = "DCs",
                 alias = "DC1",
                 #"DC2",
@@ -114,7 +114,7 @@ cyto_gate_edit(gs,
                 ylim = c(-1.5, 3),
                 gatingTemplate = "gatingTemplate.csv")
 
-cyto_gate_edit(gs,
+cyto_gate_draw(gs,
                parent = "DC1",
                alias = #"rDC1",
                  "mDC1",
@@ -143,6 +143,7 @@ cyto_gate_draw(gs,
  #Apply the gating saved in the gatingTemplate to all your samples. 
  cyto_gatingTemplate_apply(gs, gatingTemplate = "gatingTemplate.csv") #Also run at the start of the code if the gating is paused to be finished at a later date
  
+ #You can now export the gating scheme to visualise how it is doing per sample
  for (i in seq_along(gs)) {
    
    # Extract the name of the current sample for the filename
@@ -165,4 +166,50 @@ cyto_gate_draw(gs,
  }
  
  
+ library(flowWorkspace)
+ library(flowCore)
+ 
+ data_list <- list()
+ 
+ # Loop through each sample in your GatingSet
+ for (i in seq_along(gs)) {
+   
+   sample_name <- sampleNames(gs)[i]
+   message("Processing: ", sample_name)
+   
+   # 1. Extract the flowFrame and convert to a data frame
+   ff <- getData(gs[[i]])
+   cell_data <- as.data.frame(exprs(ff))
+   
+   # 2. Extract channel names and marker descriptions from the flowFrame metadata
+   pd <- Biobase::pData(flowCore::parameters(ff))
+   channels <- pd$name    # e.g., "Parameter_8"
+   markers <- pd$desc     # e.g., "B220"
+   
+   # 3. Combine them (e.g., "Parameter_8_B220"), or fall back to the channel name if no marker exists (like FSC-A)
+   new_colnames <- ifelse(!is.na(markers) & markers != "", 
+                          paste0(markers), 
+                          channels)
+   
+   # Apply the updated column names to your cell data frame
+   colnames(cell_data) <- new_colnames
+   
+   # 4. Add tracking columns
+   cell_data$sample_ID <- sample_name
+   cell_data$celltype <- NA
+   
+   # 5. Assign clean gate names
+   leaf_nodes <- gs_get_leaf_nodes(gs[[i]])
+   for (node in leaf_nodes) {
+     short_name <- basename(node)
+     indices <- gh_pop_get_indices(gs[[i]], node)
+     cell_data$celltype[indices] <- short_name
+   }
+   
+   data_list[[i]] <- cell_data
+ }
+ 
+ # 6. Combine all samples into one master file and export
+ master_data <- do.call(rbind, data_list)
+ write.csv(master_data, file = "All_Samples_Gated_Data.csv", row.names = FALSE)
  
